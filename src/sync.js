@@ -1,213 +1,117 @@
 /**
- * Transaction Sync
+ * Transaction sync (single-company: natal).
  *
- * Pulls new transactions from all linked Plaid accounts using /transactions/sync.
- * Categorizes them and outputs a summary.
+ * Pulls added/modified/removed transactions from each linked Plaid item via
+ * /transactions/sync, runs the vendor-map categorizer for a pre-fill, and
+ * upserts into the configured Google Sheet.
  *
- * Usage:
- *   npm run sync                    # sync all companies
- *   node src/sync.js CompanyName    # sync one company
- *
- * The sync is incremental — it uses a cursor to only pull new/changed
- * transactions since the last sync. First run pulls all available history.
+ *   npm run sync             # sync all linked accounts
+ *   node src/sync.js chase   # sync one account label
  */
 const { plaidClient } = require("./plaid-client");
 const tokenStore = require("./token-store");
 const { categorizeAll } = require("./categorizer");
-const { writeTransactions, writeReviewQueue } = require("./sheets");
+const { upsertTransactions } = require("./sheets");
 require("dotenv").config();
 
-const SHEET_CONFIG_PATH = require("path").join(__dirname, "..", "data", "sheet-config.json");
-
-function loadSheetConfig() {
-  const fs = require("fs");
-  if (!fs.existsSync(SHEET_CONFIG_PATH)) return {};
-  return JSON.parse(fs.readFileSync(SHEET_CONFIG_PATH, "utf-8"));
-}
-
-/**
- * Sync transactions for a single Plaid item (one linked bank connection).
- * Uses /transactions/sync for incremental updates.
- */
-async function syncAccount(company, label, accountData) {
+async function syncAccount(label, accountData) {
   const { access_token, cursor } = accountData;
 
-  let allAdded = [];
-  let allModified = [];
-  let allRemoved = [];
+  let added = [];
+  let modified = [];
+  let removed = [];
   let nextCursor = cursor;
   let hasMore = true;
 
-  console.log(`  Syncing ${company} / ${label}...`);
+  console.log(`  Syncing ${label}...`);
 
   while (hasMore) {
-    const request = {
-      access_token,
-      ...(nextCursor ? { cursor: nextCursor } : {}),
-    };
-
-    try {
-      const response = await plaidClient.transactionsSync(request);
-      const data = response.data;
-
-      allAdded = allAdded.concat(data.added);
-      allModified = allModified.concat(data.modified);
-      allRemoved = allRemoved.concat(data.removed);
-
-      hasMore = data.has_more;
-      nextCursor = data.next_cursor;
-    } catch (error) {
-      console.error(`  Error syncing ${label}:`, error.response?.data || error.message);
-      return { added: [], modified: [], removed: [], cursor: nextCursor };
-    }
+    const request = { access_token, ...(nextCursor ? { cursor: nextCursor } : {}) };
+    const response = await plaidClient.transactionsSync(request);
+    const data = response.data;
+    added = added.concat(data.added);
+    modified = modified.concat(data.modified);
+    removed = removed.concat(data.removed);
+    hasMore = data.has_more;
+    nextCursor = data.next_cursor;
   }
 
-  // Save the cursor for next time
-  tokenStore.updateCursor(company, label, nextCursor);
-
-  return {
-    added: allAdded,
-    modified: allModified,
-    removed: allRemoved,
-    cursor: nextCursor,
-  };
+  tokenStore.updateCursor(label, nextCursor);
+  return { added, modified, removed };
 }
 
-/**
- * Normalize a Plaid transaction into our standard format.
- */
-function normalizeTransaction(txn, company, label, institution) {
+function normalize(txn, label, institution) {
   return {
     id: txn.transaction_id,
+    pending_transaction_id: txn.pending_transaction_id || null,
     date: txn.date,
     description: txn.name || txn.merchant_name || "Unknown",
     merchant: txn.merchant_name || null,
-    amount: txn.amount, // Plaid: positive = debit/spend, negative = credit/income
+    amount: txn.amount,
     currency: txn.iso_currency_code || "USD",
     account_label: label,
-    institution: institution,
-    company: company,
+    institution,
     plaid_category: txn.personal_finance_category?.primary || null,
     plaid_detailed: txn.personal_finance_category?.detailed || null,
     pending: txn.pending || false,
   };
 }
 
-/**
- * Sync all companies and accounts.
- * Returns a structured summary of all new/modified/removed transactions.
- */
-async function syncAll(targetCompany) {
-  const allAccounts = tokenStore.getAllAccounts();
-  const companies = targetCompany ? [targetCompany] : Object.keys(allAccounts);
+async function syncAll(targetLabel) {
+  const accounts = tokenStore.getAccounts();
+  const labels = targetLabel ? [targetLabel] : Object.keys(accounts);
 
-  const results = {};
+  if (labels.length === 0) {
+    console.log("No accounts linked. Open http://localhost:3000 to connect.");
+    return { added: [], modified: [], removed: [] };
+  }
 
-  for (const company of companies) {
-    if (!allAccounts[company]) {
-      console.log(`Company "${company}" not found. Skipping.`);
+  const allAdded = [];
+  const allModified = [];
+  const allRemoved = [];
+
+  for (const label of labels) {
+    if (!accounts[label]) {
+      console.log(`Account "${label}" not linked. Skipping.`);
       continue;
     }
-
-    console.log(`\nSyncing company: ${company}`);
-    results[company] = { added: [], modified: [], removed: [] };
-
-    const accounts = allAccounts[company];
-    for (const [label, accountData] of Object.entries(accounts)) {
-      const syncResult = await syncAccount(company, label, accountData);
-
-      // Normalize transactions
-      const normalizedAdded = syncResult.added.map((txn) =>
-        normalizeTransaction(txn, company, label, accountData.institution)
-      );
-      const normalizedModified = syncResult.modified.map((txn) =>
-        normalizeTransaction(txn, company, label, accountData.institution)
-      );
-
-      results[company].added.push(...normalizedAdded);
-      results[company].modified.push(...normalizedModified);
-      results[company].removed.push(...syncResult.removed);
-    }
-
-    // Categorize new transactions
-    results[company].added = categorizeAll(results[company].added);
-    results[company].modified = categorizeAll(results[company].modified);
-
-    // Summary
-    const { added, modified, removed } = results[company];
-    const uncategorized = added.filter((t) => t.category === "Uncategorized");
-
-    console.log(`  ${added.length} new transactions`);
-    console.log(`  ${modified.length} modified transactions`);
-    console.log(`  ${removed.length} removed transactions`);
-    console.log(`  ${uncategorized.length} need manual categorization`);
-
-    if (uncategorized.length > 0) {
-      console.log(`\n  Uncategorized transactions for ${company}:`);
-      uncategorized.slice(0, 10).forEach((t) => {
-        console.log(`    ${t.date}  ${t.amount > 0 ? "-" : "+"}$${Math.abs(t.amount).toFixed(2)}  ${t.description}`);
-      });
-      if (uncategorized.length > 10) {
-        console.log(`    ... and ${uncategorized.length - 10} more`);
-      }
+    try {
+      const r = await syncAccount(label, accounts[label]);
+      const inst = accounts[label].institution;
+      allAdded.push(...r.added.map((t) => normalize(t, label, inst)));
+      allModified.push(...r.modified.map((t) => normalize(t, label, inst)));
+      allRemoved.push(...r.removed);
+      console.log(`    +${r.added.length} / ~${r.modified.length} / -${r.removed.length}`);
+    } catch (err) {
+      console.error(`  Error syncing ${label}:`, err.response?.data || err.message);
     }
   }
 
-  return results;
+  const combined = categorizeAll([...allAdded, ...allModified]);
+
+  const spreadsheetId = process.env.NATAL_SHEET_ID;
+  if (!spreadsheetId) {
+    console.error("\nNATAL_SHEET_ID not set in .env.local — skipping sheet write.");
+    return { added: allAdded, modified: allModified, removed: allRemoved };
+  }
+
+  await upsertTransactions(spreadsheetId, combined, allRemoved);
+
+  const uncat = combined.filter((t) => !t.category || t.category === "Uncategorized");
+  console.log(`\n  Total: ${combined.length} new/modified (${uncat.length} uncategorized)`);
+
+  return { added: allAdded, modified: allModified, removed: allRemoved };
 }
 
-// CLI entry point
 if (require.main === module) {
-  const targetCompany = process.argv[2] || null;
-
+  const label = process.argv[2] || null;
   console.log("=================================");
-  console.log("  Bookkeeper — Transaction Sync");
+  console.log("  Natal Bookkeeper — Sync");
   console.log("=================================");
-
-  syncAll(targetCompany)
-    .then(async (results) => {
-      console.log("\n--- Sync complete ---\n");
-
-      // Print totals
-      let totalAdded = 0;
-      let totalUncategorized = 0;
-      for (const [company, data] of Object.entries(results)) {
-        totalAdded += data.added.length;
-        totalUncategorized += data.added.filter((t) => t.category === "Uncategorized").length;
-      }
-      console.log(`Total new transactions: ${totalAdded}`);
-      console.log(`Total needing review: ${totalUncategorized}`);
-
-      // Save to local JSON for debugging
-      const fs = require("fs");
-      const path = require("path");
-      const outDir = path.join(__dirname, "..", "data");
-      if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(outDir, "last-sync.json"),
-        JSON.stringify(results, null, 2)
-      );
-      console.log(`\nResults saved to data/last-sync.json`);
-
-      // Write to Google Sheets
-      const sheetConfig = loadSheetConfig();
-      for (const [company, data] of Object.entries(results)) {
-        if (!sheetConfig[company]) {
-          console.log(`\n[Sheets] No sheet configured for "${company}". Run: node src/setup-sheet.js "${company}" "your-email@gmail.com"`);
-          continue;
-        }
-        const spreadsheetId = sheetConfig[company].spreadsheetId;
-        try {
-          await writeTransactions(spreadsheetId, data.added);
-          await writeReviewQueue(spreadsheetId, data.added);
-          console.log(`[Sheets] ✓ Updated sheet for "${company}"`);
-        } catch (err) {
-          console.error(`[Sheets] Error writing to sheet for "${company}":`, err.message);
-        }
-      }
-    })
+  syncAll(label)
+    .then(() => console.log("\n--- Done ---\n"))
     .catch((err) => {
-      console.error("Sync failed:", err);
+      console.error("Sync failed:", err.response?.data || err);
       process.exit(1);
     });
 }

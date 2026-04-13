@@ -1,33 +1,47 @@
 /**
- * Google Sheets Writer
+ * Google Sheets I/O — upsert transactions to the "Transactions" tab.
  *
- * Writes categorized transactions to a Google Sheet for review in Cowork.
+ * The tab's schema is stable so formulas and cowork can rely on column
+ * positions. `Category` and `Notes` are user-editable — sync updates all
+ * other columns on existing rows but never overwrites these two.
  *
- * Sheet structure:
- *   - "Transactions" tab:  all synced transactions (append-only)
- *   - "Review Queue" tab:  uncategorized items for manual categorization
- *   - "Vendor Map" tab:    vendor → category mappings (read/write)
- *
- * Setup:
- *   1. Enable Google Sheets API in your GCP project
- *   2. Create a Service Account and download the JSON key
- *   3. Set GOOGLE_SERVICE_ACCOUNT_EMAIL and GOOGLE_PRIVATE_KEY in .env
- *   4. Run: node src/setup-sheet.js "My Company"
- *      → creates the sheet and shares it with your personal Google account
+ * New rows get their `Category` pre-filled from the vendor-map match (blank
+ * for unknown vendors).
  */
 const { google } = require("googleapis");
 require("dotenv").config();
 
+const TAB = "Transactions";
+
+// Column order (A..P). Must match txnToRow below.
+const HEADERS = [
+  "Transaction ID",
+  "Date",
+  "Description",
+  "Merchant",
+  "Amount",
+  "Type",
+  "Account",
+  "Institution",
+  "Matched Vendor",
+  "Plaid Category",
+  "Plaid Detailed",
+  "Category", // user-editable
+  "Notes",    // user-editable
+  "Pending",
+  "Synced At",
+];
+
+const COL_ID = 0;
+const COL_CATEGORY = 11;
+const COL_NOTES = 12;
+
 function getAuth() {
   const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
   const key = process.env.GOOGLE_PRIVATE_KEY;
-
   if (!email || !key) {
-    throw new Error(
-      "Missing GOOGLE_SERVICE_ACCOUNT_EMAIL or GOOGLE_PRIVATE_KEY in .env"
-    );
+    throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_EMAIL or GOOGLE_PRIVATE_KEY in env");
   }
-
   return new google.auth.JWT({
     email,
     key,
@@ -35,50 +49,11 @@ function getAuth() {
   });
 }
 
-function getSheetsClient() {
+function getClient() {
   return google.sheets({ version: "v4", auth: getAuth() });
 }
 
-// ---------------------------------------------------------------------------
-// Transaction columns — order matters, must match header row
-// ---------------------------------------------------------------------------
-const TXN_HEADERS = [
-  "Transaction ID",
-  "Date",
-  "Description",
-  "Merchant",
-  "Amount",
-  "Type",
-  "Category",
-  "Matched Vendor",
-  "Account",
-  "Institution",
-  "Company",
-  "Currency",
-  "Pending",
-  "Plaid Category",
-  "Plaid Detailed",
-  "Synced At",
-];
-
-const REVIEW_HEADERS = [
-  "Transaction ID",
-  "Date",
-  "Description",
-  "Merchant",
-  "Amount",
-  "Type",
-  "Category",
-  "Account",
-  "Institution",
-];
-
-const VENDOR_MAP_HEADERS = ["Vendor Key", "Category"];
-
-/**
- * Convert a transaction object to a row array matching TXN_HEADERS order.
- */
-function txnToRow(t) {
+function txnToRow(t, preservedCategory, preservedNotes) {
   return [
     t.id,
     t.date,
@@ -86,170 +61,185 @@ function txnToRow(t) {
     t.merchant || "",
     t.amount,
     t.amount > 0 ? "Expense" : "Income",
-    t.category || "Uncategorized",
-    t.matched_vendor || "",
     t.account_label,
     t.institution,
-    t.company,
-    t.currency || "USD",
-    t.pending ? "Yes" : "No",
+    t.matched_vendor || "",
     t.plaid_category || "",
     t.plaid_detailed || "",
+    preservedCategory !== undefined
+      ? preservedCategory
+      : (t.category && t.category !== "Uncategorized" ? t.category : ""),
+    preservedNotes !== undefined ? preservedNotes : "",
+    t.pending ? "Yes" : "No",
     new Date().toISOString(),
   ];
 }
 
-/**
- * Convert a transaction to a review-queue row.
- */
-function txnToReviewRow(t) {
-  return [
-    t.id,
-    t.date,
-    t.description,
-    t.merchant || "",
-    t.amount,
-    t.amount > 0 ? "Expense" : "Income",
-    "", // Category — left blank for manual entry
-    t.account_label,
-    t.institution,
-  ];
+async function ensureTab(sheets, spreadsheetId) {
+  const meta = await sheets.spreadsheets.get({ spreadsheetId });
+  const exists = meta.data.sheets.some((s) => s.properties.title === TAB);
+  if (exists) return;
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [
+        {
+          addSheet: {
+            properties: {
+              title: TAB,
+              gridProperties: { frozenRowCount: 1 },
+            },
+          },
+        },
+      ],
+    },
+  });
 }
 
-// ---------------------------------------------------------------------------
-// Core write functions
-// ---------------------------------------------------------------------------
-
-/**
- * Append transactions to the "Transactions" tab.
- * Creates the header row if the sheet is empty.
- */
-async function writeTransactions(spreadsheetId, transactions) {
-  if (transactions.length === 0) return { written: 0 };
-
-  const sheets = getSheetsClient();
-
-  // Ensure header row exists
-  const existing = await sheets.spreadsheets.values.get({
+async function ensureHeaders(sheets, spreadsheetId) {
+  await ensureTab(sheets, spreadsheetId);
+  const res = await sheets.spreadsheets.values.get({
     spreadsheetId,
-    range: "Transactions!A1:A1",
+    range: `${TAB}!A1:${colLetter(HEADERS.length)}1`,
   });
-  if (!existing.data.values || existing.data.values.length === 0) {
+  const current = (res.data.values && res.data.values[0]) || [];
+  const matches = HEADERS.every((h, i) => current[i] === h);
+  if (!matches) {
     await sheets.spreadsheets.values.update({
       spreadsheetId,
-      range: "Transactions!A1",
+      range: `${TAB}!A1`,
       valueInputOption: "RAW",
-      requestBody: { values: [TXN_HEADERS] },
+      requestBody: { values: [HEADERS] },
     });
   }
+}
 
-  // Append rows
-  const rows = transactions.map(txnToRow);
-  await sheets.spreadsheets.values.append({
-    spreadsheetId,
-    range: "Transactions!A:A",
-    valueInputOption: "RAW",
-    insertDataOption: "INSERT_ROWS",
-    requestBody: { values: rows },
-  });
+async function getSheetId(sheets, spreadsheetId) {
+  const meta = await sheets.spreadsheets.get({ spreadsheetId });
+  const tab = meta.data.sheets.find((s) => s.properties.title === TAB);
+  if (!tab) throw new Error(`Tab "${TAB}" not found in spreadsheet`);
+  return tab.properties.sheetId;
+}
 
-  console.log(
-    `  [Sheets] Wrote ${rows.length} transactions to Transactions tab`
-  );
-  return { written: rows.length };
+function colLetter(n) {
+  // 1-indexed column number -> A1 letter
+  let s = "";
+  while (n > 0) {
+    const m = (n - 1) % 26;
+    s = String.fromCharCode(65 + m) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
 }
 
 /**
- * Replace the "Review Queue" tab with current uncategorized transactions.
- * This is a full replace (not append) so resolved items disappear.
+ * Upsert a batch of transactions.
+ *
+ *   added:   txns to add or update
+ *   removed: Plaid removed records (either { transaction_id } objects or bare ids)
+ *
+ * Pending→posted transition: Plaid sets `pending_transaction_id` on the posted
+ * txn pointing at the earlier pending row. We delete the pending row so it
+ * doesn't show up twice.
  */
-async function writeReviewQueue(spreadsheetId, transactions) {
-  const uncategorized = transactions.filter(
-    (t) => t.category === "Uncategorized"
-  );
+async function upsertTransactions(spreadsheetId, added, removed = []) {
+  const sheets = getClient();
+  await ensureHeaders(sheets, spreadsheetId);
 
-  const sheets = getSheetsClient();
-
-  // Clear existing data
-  await sheets.spreadsheets.values.clear({
+  // 1. Read existing ids + user-editable columns
+  const lastCol = colLetter(HEADERS.length);
+  const existingRes = await sheets.spreadsheets.values.get({
     spreadsheetId,
-    range: "Review Queue!A:Z",
+    range: `${TAB}!A2:${lastCol}`,
   });
-
-  // Write header + rows
-  const rows = [REVIEW_HEADERS, ...uncategorized.map(txnToReviewRow)];
-  await sheets.spreadsheets.values.update({
-    spreadsheetId,
-    range: "Review Queue!A1",
-    valueInputOption: "RAW",
-    requestBody: { values: rows },
-  });
-
-  console.log(
-    `  [Sheets] Wrote ${uncategorized.length} items to Review Queue`
-  );
-  return { written: uncategorized.length };
-}
-
-/**
- * Read the "Vendor Map" tab and return a { vendorKey: category } object.
- * Cowork or the user can edit this tab to add new mappings.
- */
-async function readVendorMap(spreadsheetId) {
-  const sheets = getSheetsClient();
-
-  try {
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: "Vendor Map!A2:B",
-    });
-
-    const rows = res.data.values || [];
-    const map = {};
-    for (const [vendor, category] of rows) {
-      if (vendor && category) {
-        map[vendor.toUpperCase()] = category;
-      }
+  const existingRows = existingRes.data.values || [];
+  const existingById = new Map();
+  existingRows.forEach((row, i) => {
+    const id = row[COL_ID];
+    if (id) {
+      existingById.set(id, {
+        rowIndex: i + 2, // sheet row (1-indexed, +1 for header)
+        category: row[COL_CATEGORY] || "",
+        notes: row[COL_NOTES] || "",
+      });
     }
-    return map;
-  } catch (err) {
-    console.warn("  [Sheets] Could not read Vendor Map:", err.message);
-    return {};
+  });
+
+  // 2. Split incoming into updates vs appends; collect pending rows to drop
+  const updates = []; // { range, values }
+  const appends = []; // row arrays
+  const rowsToDelete = new Set(); // 0-indexed row numbers (for deleteDimension)
+
+  for (const t of added) {
+    const existing = existingById.get(t.id);
+    if (existing) {
+      const row = txnToRow(t, existing.category, existing.notes);
+      updates.push({
+        range: `${TAB}!A${existing.rowIndex}:${lastCol}${existing.rowIndex}`,
+        values: [row],
+      });
+    } else {
+      appends.push(txnToRow(t));
+    }
+    if (t.pending_transaction_id && existingById.has(t.pending_transaction_id)) {
+      rowsToDelete.add(existingById.get(t.pending_transaction_id).rowIndex - 1);
+    }
   }
+
+  // 3. Removed ids -> delete rows
+  for (const r of removed) {
+    const id = typeof r === "string" ? r : r.transaction_id;
+    const existing = existingById.get(id);
+    if (existing) rowsToDelete.add(existing.rowIndex - 1);
+  }
+
+  // 4. Execute updates
+  if (updates.length > 0) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId,
+      requestBody: { valueInputOption: "RAW", data: updates },
+    });
+  }
+
+  // 5. Execute appends
+  if (appends.length > 0) {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId,
+      range: `${TAB}!A:A`,
+      valueInputOption: "RAW",
+      insertDataOption: "INSERT_ROWS",
+      requestBody: { values: appends },
+    });
+  }
+
+  // 6. Execute deletes (descending, so earlier indices stay valid)
+  if (rowsToDelete.size > 0) {
+    const sheetId = await getSheetId(sheets, spreadsheetId);
+    const sorted = [...rowsToDelete].sort((a, b) => b - a);
+    const requests = sorted.map((rowIdx) => ({
+      deleteDimension: {
+        range: {
+          sheetId,
+          dimension: "ROWS",
+          startIndex: rowIdx,
+          endIndex: rowIdx + 1,
+        },
+      },
+    }));
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: { requests },
+    });
+  }
+
+  console.log(
+    `  [Sheets] upsert: ${appends.length} new, ${updates.length} updated, ${rowsToDelete.size} deleted`
+  );
+  return {
+    added: appends.length,
+    updated: updates.length,
+    deleted: rowsToDelete.size,
+  };
 }
 
-/**
- * Write the full vendor map to the "Vendor Map" tab.
- */
-async function writeVendorMap(spreadsheetId, vendorMap) {
-  const sheets = getSheetsClient();
-
-  const rows = [
-    VENDOR_MAP_HEADERS,
-    ...Object.entries(vendorMap).map(([k, v]) => [k, v]),
-  ];
-
-  await sheets.spreadsheets.values.clear({
-    spreadsheetId,
-    range: "Vendor Map!A:Z",
-  });
-
-  await sheets.spreadsheets.values.update({
-    spreadsheetId,
-    range: "Vendor Map!A1",
-    valueInputOption: "RAW",
-    requestBody: { values: rows },
-  });
-
-  console.log(`  [Sheets] Wrote ${rows.length - 1} entries to Vendor Map`);
-}
-
-module.exports = {
-  writeTransactions,
-  writeReviewQueue,
-  readVendorMap,
-  writeVendorMap,
-  TXN_HEADERS,
-  REVIEW_HEADERS,
-  VENDOR_MAP_HEADERS,
-};
+module.exports = { upsertTransactions, HEADERS, TAB };

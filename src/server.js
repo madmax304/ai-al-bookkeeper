@@ -1,17 +1,14 @@
 /**
- * Plaid Link Server
+ * Plaid Link Server (single-company: natal)
  *
- * Run with: npm start
- * Then open http://localhost:3000 in your browser.
+ * Run:  npm start
+ * Then: http://localhost:3000
  *
- * This serves a simple UI where you:
- * 1. Enter a company name and account label
- * 2. Click "Connect Bank Account"
- * 3. Plaid Link opens → you authenticate → access token is stored locally
+ * Connect Chase and AMEX via Plaid Link. In production, both are
+ * OAuth-required institutions — the PLAID_REDIRECT_URI env var must be
+ * set and registered in the Plaid dashboard.
  *
- * In Sandbox mode, use these test credentials:
- *   Username: user_good
- *   Password: pass_good
+ * Sandbox credentials: user_good / pass_good
  */
 const express = require("express");
 const path = require("path");
@@ -20,42 +17,42 @@ const tokenStore = require("./token-store");
 const { Products, CountryCode } = require("plaid");
 require("dotenv").config();
 
+const COMPANY = "natal";
+const REDIRECT_URI = process.env.PLAID_REDIRECT_URI || null;
+
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "..", "public")));
 
-// Create a Link token (needed to initialize Plaid Link in the browser)
 app.post("/api/create-link-token", async (req, res) => {
   try {
-    const response = await plaidClient.linkTokenCreate({
-      user: { client_user_id: req.body.company || "default" },
-      client_name: "Bookkeeper",
+    const request = {
+      user: { client_user_id: COMPANY },
+      client_name: "Natal Bookkeeper",
       products: [Products.Transactions],
       country_codes: [CountryCode.Us],
       language: "en",
-    });
+    };
+    if (REDIRECT_URI) request.redirect_uri = REDIRECT_URI;
+
+    const response = await plaidClient.linkTokenCreate(request);
     res.json({ link_token: response.data.link_token });
   } catch (error) {
-    console.error("Error creating link token:", error.response?.data || error.message);
+    console.error("linkTokenCreate:", error.response?.data || error.message);
     res.status(500).json({ error: error.response?.data || error.message });
   }
 });
 
-// Exchange public token for access token (happens after user completes Link)
 app.post("/api/exchange-token", async (req, res) => {
   try {
-    const { public_token, company, label } = req.body;
+    const { public_token, label } = req.body;
+    if (!label) return res.status(400).json({ error: "label is required" });
 
-    // Exchange the public token for a permanent access token
-    const exchangeResponse = await plaidClient.itemPublicTokenExchange({
-      public_token,
-    });
+    const exchange = await plaidClient.itemPublicTokenExchange({ public_token });
+    const { access_token, item_id } = exchange.data;
 
-    const { access_token, item_id } = exchangeResponse.data;
-
-    // Get account details
-    const accountsResponse = await plaidClient.accountsGet({ access_token });
-    const accounts = accountsResponse.data.accounts.map((a) => ({
+    const accountsRes = await plaidClient.accountsGet({ access_token });
+    const accounts = accountsRes.data.accounts.map((a) => ({
       id: a.account_id,
       name: a.name,
       type: a.type,
@@ -63,51 +60,44 @@ app.post("/api/exchange-token", async (req, res) => {
       mask: a.mask,
     }));
 
-    const institution_id = accountsResponse.data.item.institution_id;
-    let institution_name = "Unknown";
+    let institution = "Unknown";
+    const institution_id = accountsRes.data.item.institution_id;
     if (institution_id) {
       try {
-        const instResponse = await plaidClient.institutionsGetById({
+        const inst = await plaidClient.institutionsGetById({
           institution_id,
           country_codes: [CountryCode.Us],
         });
-        institution_name = instResponse.data.institution.name;
-      } catch (e) {
-        // Non-critical, continue
-      }
+        institution = inst.data.institution.name;
+      } catch (_) {}
     }
 
-    // Store the token
-    tokenStore.addAccount(company, label, {
-      access_token,
-      item_id,
-      institution: institution_name,
-      accounts,
-    });
+    tokenStore.addAccount(label, { access_token, item_id, institution, accounts });
 
-    res.json({
-      success: true,
-      institution: institution_name,
-      accounts,
-    });
+    res.json({ success: true, institution, accounts });
   } catch (error) {
-    console.error("Error exchanging token:", error.response?.data || error.message);
+    console.error("exchangeToken:", error.response?.data || error.message);
     res.status(500).json({ error: error.response?.data || error.message });
   }
 });
 
-// List all linked accounts
 app.get("/api/accounts", (req, res) => {
-  res.json(tokenStore.getAllAccounts());
+  res.json(tokenStore.getAccounts());
+});
+
+// OAuth return — Plaid redirects here after the user authenticates with their
+// bank. We serve the same SPA; the frontend detects oauth=1 and re-opens Link
+// with receivedRedirectUri so it can complete the flow.
+app.get("/oauth-return", (req, res) => {
+  res.sendFile(path.join(__dirname, "..", "public", "index.html"));
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`\n  Bookkeeper - Plaid Link Server`);
-  console.log(`  ================================`);
-  console.log(`  Open http://localhost:${PORT} to connect bank accounts`);
-  console.log(`  Environment: ${process.env.PLAID_ENV || "sandbox"}`);
-  console.log(`\n  Sandbox credentials:`);
-  console.log(`    Username: user_good`);
-  console.log(`    Password: pass_good\n`);
+  console.log(`\n  Natal Bookkeeper — Plaid Link`);
+  console.log(`  ==============================`);
+  console.log(`  http://localhost:${PORT}`);
+  console.log(`  Plaid env: ${process.env.PLAID_ENV || "sandbox"}`);
+  console.log(`  Redirect URI: ${REDIRECT_URI || "(not set)"}`);
+  console.log(`\n  Sandbox: user_good / pass_good\n`);
 });
