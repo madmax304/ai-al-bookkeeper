@@ -3,7 +3,7 @@
  * Used by both the Link server and the sync module.
  */
 const { Configuration, PlaidApi, PlaidEnvironments } = require("plaid");
-require("dotenv").config();
+require("dotenv").config({ path: require("path").join(__dirname, "..", ".env.local") });
 
 const envMap = {
   sandbox: PlaidEnvironments.sandbox,

@@ -15,7 +15,7 @@ const path = require("path");
 const { plaidClient } = require("./plaid-client");
 const tokenStore = require("./token-store");
 const { Products, CountryCode } = require("plaid");
-require("dotenv").config();
+require("dotenv").config({ path: require("path").join(__dirname, "..", ".env.local") });
 
 const COMPANY = "natal";
 const REDIRECT_URI = process.env.PLAID_REDIRECT_URI || null;

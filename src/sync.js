@@ -12,7 +12,7 @@ const { plaidClient } = require("./plaid-client");
 const tokenStore = require("./token-store");
 const { categorizeAll } = require("./categorizer");
 const { upsertTransactions } = require("./sheets");
-require("dotenv").config();
+require("dotenv").config({ path: require("path").join(__dirname, "..", ".env.local") });
 
 async function syncAccount(label, accountData) {
   const { access_token, cursor } = accountData;

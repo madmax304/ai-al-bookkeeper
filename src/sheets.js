@@ -9,7 +9,7 @@
  * for unknown vendors).
  */
 const { google } = require("googleapis");
-require("dotenv").config();
+require("dotenv").config({ path: require("path").join(__dirname, "..", ".env.local") });
 
 const TAB = "Transactions";
 
