@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bookkeeper — Connect Bank Accounts</title>
+  <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f7fa; color: #1a1a2e; padding: 40px 20px; }
+    .container { max-width: 640px; margin: 0 auto; }
+    h1 { font-size: 28px; font-weight: 700; margin-bottom: 8px; color: #1B4F72; }
+    .subtitle { color: #666; margin-bottom: 32px; font-size: 15px; }
+    .card { background: white; border-radius: 12px; padding: 28px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 24px; }
+    .card h2 { font-size: 18px; margin-bottom: 20px; color: #1B4F72; }
+    label { display: block; font-size: 13px; font-weight: 600; color: #444; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+    input, select { width: 100%; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 15px; margin-bottom: 16px; outline: none; transition: border 0.2s; }
+    input:focus, select:focus { border-color: #1B4F72; }
+    button { background: #1B4F72; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; width: 100%; transition: background 0.2s; }
+    button:hover { background: #154360; }
+    button:disabled { background: #aaa; cursor: not-allowed; }
+    .status { padding: 12px 16px; border-radius: 8px; margin-top: 16px; font-size: 14px; display: none; }
+    .status.success { display: block; background: #e8f5e9; color: #2e7d32; }
+    .status.error { display: block; background: #fbe9e7; color: #c62828; }
+    .accounts-list { margin-top: 8px; }
+    .account-item { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border: 1px solid #eee; border-radius: 8px; margin-bottom: 8px; }
+    .account-item .institution { font-weight: 600; }
+    .account-item .details { color: #666; font-size: 13px; }
+    .empty { color: #999; font-style: italic; font-size: 14px; padding: 12px 0; }
+    .sandbox-note { background: #fff3cd; border: 1px solid #ffc107; border-radius: 8px; padding: 12px 16px; margin-bottom: 24px; font-size: 13px; }
+    .sandbox-note strong { color: #856404; }
+    .sandbox-note code { background: #f8f0d8; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Bookkeeper</h1>
+    <p class="subtitle">Connect bank accounts via Plaid to automate your books.</p>
+
+    <div class="sandbox-note">
+      <strong>Sandbox Mode:</strong> Use username <code>user_good</code> and password <code>pass_good</code> to test with fake bank data. Select any bank in the Plaid Link UI.
+    </div>
+
+    <div class="card">
+      <h2>Connect a Bank Account</h2>
+      <label for="company">Company</label>
+      <input type="text" id="company" placeholder="e.g. Acme LLC" />
+
+      <label for="label">Account Label</label>
+      <input type="text" id="label" placeholder="e.g. chase-checking, amex-card" />
+
+      <button id="connect-btn" onclick="connectBank()">Connect Bank Account</button>
+      <div id="status" class="status"></div>
+    </div>
+
+    <div class="card">
+      <h2>Linked Accounts</h2>
+      <div id="accounts-list" class="accounts-list">
+        <p class="empty">No accounts linked yet.</p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    async function loadAccounts() {
+      const res = await fetch("/api/accounts");
+      const data = await res.json();
+      const list = document.getElementById("accounts-list");
+
+      const entries = [];
+      for (const [company, accounts] of Object.entries(data)) {
+        for (const [label, info] of Object.entries(accounts)) {
+          entries.push({ company, label, ...info });
+        }
+      }
+
+      if (entries.length === 0) {
+        list.innerHTML = '<p class="empty">No accounts linked yet.</p>';
+        return;
+      }
+
+      list.innerHTML = entries.map(e => `
+        <div class="account-item">
+          <div>
+            <div class="institution">${e.company} — ${e.label}</div>
+            <div class="details">${e.institution} · ${e.accounts?.map(a => a.name).join(", ") || "?"}</div>
+          </div>
+        </div>
+      `).join("");
+    }
+
+    async function connectBank() {
+      const company = document.getElementById("company").value.trim();
+      const label = document.getElementById("label").value.trim();
+      const status = document.getElementById("status");
+      const btn = document.getElementById("connect-btn");
+
+      if (!company || !label) {
+        status.className = "status error";
+        status.textContent = "Please enter both a company name and account label.";
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = "Initializing Plaid Link...";
+      status.style.display = "none";
+
+      try {
+        // Get a link token from our server
+        const tokenRes = await fetch("/api/create-link-token", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ company }),
+        });
+        const { link_token, error } = await tokenRes.json();
+
+        if (error) throw new Error(JSON.stringify(error));
+
+        // Open Plaid Link
+        const handler = Plaid.create({
+          token: link_token,
+          onSuccess: async (public_token, metadata) => {
+            status.className = "status success";
+            status.textContent = "Exchanging token...";
+
+            const exchangeRes = await fetch("/api/exchange-token", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ public_token, company, label }),
+            });
+            const result = await exchangeRes.json();
+
+            if (result.success) {
+              status.className = "status success";
+              status.textContent = `Connected: ${result.institution} (${result.accounts.map(a => a.name).join(", ")})`;
+              loadAccounts();
+            } else {
+              status.className = "status error";
+              status.textContent = `Error: ${JSON.stringify(result.error)}`;
+            }
+
+            btn.disabled = false;
+            btn.textContent = "Connect Bank Account";
+          },
+          onExit: (err) => {
+            btn.disabled = false;
+            btn.textContent = "Connect Bank Account";
+            if (err) {
+              status.className = "status error";
+              status.textContent = `Link exited: ${err.display_message || err.error_message}`;
+            }
+          },
+        });
+
+        handler.open();
+      } catch (err) {
+        status.className = "status error";
+        status.textContent = `Error: ${err.message}`;
+        btn.disabled = false;
+        btn.textContent = "Connect Bank Account";
+      }
+    }
+
+    // Load existing accounts on page load
+    loadAccounts();
+  </script>
+</body>
+</html>
