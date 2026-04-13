@@ -21,6 +21,7 @@ const COA_TAB = "Chart of Accounts";
 const VENDOR_TAB = "Vendor Map";
 const REVIEW_TAB = "Review Queue";
 const PNL_TAB = "P&L";
+const VENDOR_SPEND_TAB = "Vendor Spend";
 
 const CATEGORY_COL_INDEX = TXN_HEADERS.indexOf("Category"); // 0-based
 const PENDING_COL_INDEX = TXN_HEADERS.indexOf("Pending");
@@ -145,16 +146,38 @@ async function setupPnl(sheets, spreadsheetId, tabs) {
   await addTab(sheets, spreadsheetId, PNL_TAB, {
     tabColor: { red: 0.45, green: 0.2, blue: 0.7 },
   });
+  // Per-category totals across three timeframes. ARRAYFORMULA expands
+  // automatically as you add categories in Chart of Accounts.
+  // Amounts: Plaid uses +expense / -income, so we show the raw sign.
   const rows = [
-    ["P&L by Category (all time, excludes transfers)", "", ""],
+    ["Category", "This Month", "YTD", "All Time"],
     [
-      `=QUERY(${TXN_TAB}!A:O, "select L, F, sum(E) where L <> '' and F <> 'Transfer' group by L, F pivot F label L 'Category'", 1)`,
-      "",
-      "",
+      `=IFERROR(ARRAYFORMULA(IF('${COA_TAB}'!A2:A="", "", '${COA_TAB}'!A2:A)))`,
+      `=IFERROR(ARRAYFORMULA(IF('${COA_TAB}'!A2:A="", "", SUMIFS(${TXN_TAB}!E:E, ${TXN_TAB}!L:L, '${COA_TAB}'!A2:A, ${TXN_TAB}!B:B, ">="&EOMONTH(TODAY(),-1)+1, ${TXN_TAB}!B:B, "<="&EOMONTH(TODAY(),0)))))`,
+      `=IFERROR(ARRAYFORMULA(IF('${COA_TAB}'!A2:A="", "", SUMIFS(${TXN_TAB}!E:E, ${TXN_TAB}!L:L, '${COA_TAB}'!A2:A, ${TXN_TAB}!B:B, ">="&DATE(YEAR(TODAY()),1,1)))))`,
+      `=IFERROR(ARRAYFORMULA(IF('${COA_TAB}'!A2:A="", "", SUMIFS(${TXN_TAB}!E:E, ${TXN_TAB}!L:L, '${COA_TAB}'!A2:A))))`,
     ],
   ];
   await writeValues(sheets, spreadsheetId, `${PNL_TAB}!A1`, rows);
-  console.log(`  + ${PNL_TAB} (pivot QUERY)`);
+  console.log(`  + ${PNL_TAB} (per-category / month / YTD / all-time)`);
+}
+
+async function setupVendorSpend(sheets, spreadsheetId, tabs) {
+  if (VENDOR_SPEND_TAB in tabs) return;
+  await addTab(sheets, spreadsheetId, VENDOR_SPEND_TAB, {
+    tabColor: { red: 0.2, green: 0.4, blue: 0.6 },
+  });
+  // Top spend by merchant (falls back to description when merchant is blank).
+  // Excludes transfers and income.
+  const query =
+    `=QUERY({${TXN_TAB}!A:O}, ` +
+    `"select Col3, Col12, sum(Col5), count(Col1) ` +
+    `where Col6='Expense' and Col12 <> 'Transfer' ` +
+    `group by Col3, Col12 ` +
+    `order by sum(Col5) desc ` +
+    `label Col3 'Description', Col12 'Category', sum(Col5) 'Total Spend', count(Col1) 'Txns'", 1)`;
+  await writeValues(sheets, spreadsheetId, `${VENDOR_SPEND_TAB}!A1`, [[query]]);
+  console.log(`  + ${VENDOR_SPEND_TAB} (sorted by total spend)`);
 }
 
 async function applyCategoryValidation(sheets, spreadsheetId, tabs) {
@@ -244,6 +267,7 @@ async function setup(spreadsheetId) {
   await setupVendorMap(sheets, spreadsheetId, tabs);
   await setupReviewQueue(sheets, spreadsheetId, tabs);
   await setupPnl(sheets, spreadsheetId, tabs);
+  await setupVendorSpend(sheets, spreadsheetId, tabs);
 
   // Re-fetch so the newly-created CoA sheet id is available if needed later.
   const refreshed = await getTabs(sheets, spreadsheetId);
