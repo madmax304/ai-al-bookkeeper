@@ -85,6 +85,31 @@ app.get("/api/accounts", (req, res) => {
   res.json(tokenStore.getAccounts());
 });
 
+// Update-mode link token: re-authenticates an existing item after Plaid
+// throws ITEM_LOGIN_REQUIRED (user's bank forced re-auth).
+app.post("/api/relink", async (req, res) => {
+  try {
+    const { label } = req.body;
+    const accounts = tokenStore.getAccounts();
+    if (!accounts[label]) {
+      return res.status(404).json({ error: `Account "${label}" not found` });
+    }
+    const request = {
+      user: { client_user_id: COMPANY },
+      client_name: "Natal Bookkeeper",
+      country_codes: [CountryCode.Us],
+      language: "en",
+      access_token: accounts[label].access_token,
+    };
+    if (REDIRECT_URI) request.redirect_uri = REDIRECT_URI;
+    const response = await plaidClient.linkTokenCreate(request);
+    res.json({ link_token: response.data.link_token });
+  } catch (error) {
+    console.error("relink:", error.response?.data || error.message);
+    res.status(500).json({ error: error.response?.data || error.message });
+  }
+});
+
 // OAuth return — Plaid redirects here after the user authenticates with their
 // bank. We serve the same SPA; the frontend detects oauth=1 and re-opens Link
 // with receivedRedirectUri so it can complete the flow.

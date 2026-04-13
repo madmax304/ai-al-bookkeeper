@@ -11,7 +11,13 @@
 const { plaidClient } = require("./plaid-client");
 const tokenStore = require("./token-store");
 const { categorizeAll, DEFAULT_VENDORS } = require("./categorizer");
-const { upsertTransactions, readVendorMap } = require("./sheets");
+const { upsertTransactions, readVendorMap, markTransfers } = require("./sheets");
+const fs = require("fs");
+const path = require("path");
+
+const DATA_DIR = path.join(__dirname, "..", "data");
+const LAST_SYNC_PATH = path.join(DATA_DIR, "last-sync.json");
+const LOG_PATH = path.join(DATA_DIR, "sync.log");
 require("dotenv").config({ path: require("path").join(__dirname, "..", ".env.local") });
 
 async function syncAccount(label, accountData) {
@@ -103,12 +109,45 @@ async function syncAll(targetLabel) {
 
   const combined = categorizeAll([...allAdded, ...allModified], vendorMap);
 
-  await upsertTransactions(spreadsheetId, combined, allRemoved);
+  const upsertResult = await upsertTransactions(spreadsheetId, combined, allRemoved);
+  const transferResult = await markTransfers(spreadsheetId);
+  if (transferResult.pairs > 0) {
+    console.log(
+      `  [Transfers] ${transferResult.pairs} pair(s) detected, ${transferResult.patched} row(s) updated`
+    );
+  }
 
-  const uncat = combined.filter((t) => !t.category || t.category === "Uncategorized");
+  const uncat = combined.filter((t) => !t.category);
   console.log(`\n  Total: ${combined.length} new/modified (${uncat.length} uncategorized)`);
 
-  return { added: allAdded, modified: allModified, removed: allRemoved };
+  const summary = {
+    ts: new Date().toISOString(),
+    accounts: Object.keys(accounts),
+    counts: {
+      added: upsertResult.added,
+      updated: upsertResult.updated,
+      deleted: upsertResult.deleted,
+      uncategorized: uncat.length,
+      transfer_pairs: transferResult.pairs,
+    },
+    uncategorized: uncat.map((t) => ({
+      id: t.id,
+      date: t.date,
+      amount: t.amount,
+      description: t.description,
+      account: t.account_label,
+    })),
+  };
+  writeRunArtifacts(summary);
+
+  return { added: allAdded, modified: allModified, removed: allRemoved, summary };
+}
+
+function writeRunArtifacts(summary) {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(LAST_SYNC_PATH, JSON.stringify(summary, null, 2));
+  const line = `${summary.ts}  added=${summary.counts.added} updated=${summary.counts.updated} deleted=${summary.counts.deleted} uncat=${summary.counts.uncategorized} transfers=${summary.counts.transfer_pairs}\n`;
+  fs.appendFileSync(LOG_PATH, line);
 }
 
 if (require.main === module) {

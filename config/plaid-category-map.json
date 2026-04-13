@@ -1,0 +1,19 @@
+{
+  "_comment": "Fallback mapping from Plaid personal_finance_category.primary → your Chart of Accounts. Used only when no vendor-map entry matches. Edit to match your CoA.",
+  "FOOD_AND_DRINK": "Meals & Entertainment",
+  "ENTERTAINMENT": "Meals & Entertainment",
+  "TRANSPORTATION": "Travel",
+  "TRAVEL": "Travel",
+  "GENERAL_MERCHANDISE": "Office Supplies & Equipment",
+  "HOME_IMPROVEMENT": "Office Supplies & Equipment",
+  "RENT_AND_UTILITIES": "Utilities & Telecom",
+  "BANK_FEES": "Bank Fees & Interest",
+  "LOAN_PAYMENTS": "Bank Fees & Interest",
+  "GENERAL_SERVICES": "Professional Services",
+  "MEDICAL": "Uncategorized",
+  "PERSONAL_CARE": "Uncategorized",
+  "GOVERNMENT_AND_NON_PROFIT": "Uncategorized",
+  "TRANSFER_IN": "Transfer",
+  "TRANSFER_OUT": "Transfer",
+  "INCOME": "Revenue"
+}

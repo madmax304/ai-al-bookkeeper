@@ -12,7 +12,7 @@
 const fs = require("fs");
 const path = require("path");
 
-const PFC_MAP_PATH = path.join(__dirname, "..", "data", "plaid-category-map.json");
+const PFC_MAP_PATH = path.join(__dirname, "..", "config", "plaid-category-map.json");
 
 const DEFAULT_VENDORS = {
   // Software & SaaS

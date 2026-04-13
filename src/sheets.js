@@ -172,6 +172,11 @@ async function upsertTransactions(spreadsheetId, added, removed = []) {
 
   for (const t of added) {
     const existing = existingById.get(t.id);
+    // If this posted txn supersedes a pending one, carry the user's edits
+    // from the pending row before we delete it below.
+    const pending =
+      t.pending_transaction_id && existingById.get(t.pending_transaction_id);
+
     if (existing) {
       const row = txnToRow(t, existing.category, existing.notes);
       updates.push({
@@ -179,10 +184,12 @@ async function upsertTransactions(spreadsheetId, added, removed = []) {
         values: [row],
       });
     } else {
-      appends.push(txnToRow(t));
+      const carryCat = pending ? pending.category : undefined;
+      const carryNotes = pending ? pending.notes : undefined;
+      appends.push(txnToRow(t, carryCat, carryNotes));
     }
-    if (t.pending_transaction_id && existingById.has(t.pending_transaction_id)) {
-      rowsToDelete.add(existingById.get(t.pending_transaction_id).rowIndex - 1);
+    if (pending) {
+      rowsToDelete.add(pending.rowIndex - 1);
     }
   }
 
@@ -268,4 +275,91 @@ async function readVendorMap(spreadsheetId) {
   }
 }
 
-module.exports = { upsertTransactions, readVendorMap, HEADERS, TAB };
+/**
+ * Detect transfer pairs across accounts and stamp Type = "Transfer" on both
+ * rows. A pair is two rows with equal |amount|, opposite signs, different
+ * accounts, and dates within `windowDays`. Reads from the sheet so it catches
+ * transfers that span sync runs (e.g. AMEX charge today, Chase payment
+ * clearing tomorrow).
+ *
+ * Returns { pairs: N, patched: N }. Idempotent — skips rows already marked.
+ */
+/**
+ * Pure: given parsed rows, return which ones should be marked Type="Transfer".
+ * Exported for testing.
+ *
+ *   rows:        [{ id, date, amount, type, account }]
+ *   windowDays:  max date gap between the two sides of a transfer
+ *   Returns:     [{ rowIndex, id }] — caller decides how to write
+ */
+function findTransferPairs(rows, { windowDays = 3 } = {}) {
+  const dayMs = 86400000;
+  const used = new Set();
+  const toMark = [];
+  const expenses = rows.filter((r) => r.amount > 0);
+  const incomes = rows.filter((r) => r.amount < 0);
+
+  for (const e of expenses) {
+    if (used.has(e.id)) continue;
+    for (const i of incomes) {
+      if (used.has(i.id)) continue;
+      if (i.account === e.account) continue;
+      if (Math.abs(Math.abs(i.amount) - e.amount) > 0.005) continue;
+      const dd = Math.abs(new Date(e.date) - new Date(i.date));
+      if (dd > windowDays * dayMs) continue;
+      used.add(e.id);
+      used.add(i.id);
+      for (const r of [e, i]) {
+        if (r.type !== "Transfer") toMark.push(r);
+      }
+      break;
+    }
+  }
+  return toMark;
+}
+
+async function markTransfers(spreadsheetId, opts = {}) {
+  const sheets = getClient();
+  const lastCol = colLetter(HEADERS.length);
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `${TAB}!A2:${lastCol}`,
+  });
+  const sheetRows = res.data.values || [];
+  if (sheetRows.length === 0) return { pairs: 0, patched: 0 };
+
+  const IDX_ID = 0, IDX_DATE = 1, IDX_AMOUNT = 4, IDX_TYPE = 5, IDX_ACCT = 6;
+  const parsed = sheetRows
+    .map((r, i) => ({
+      rowIndex: i + 2,
+      id: r[IDX_ID],
+      date: r[IDX_DATE],
+      amount: parseFloat(r[IDX_AMOUNT]),
+      type: r[IDX_TYPE],
+      account: r[IDX_ACCT],
+    }))
+    .filter((r) => r.id && !Number.isNaN(r.amount));
+
+  const toMark = findTransferPairs(parsed, opts);
+  if (toMark.length === 0) return { pairs: 0, patched: 0 };
+
+  const typeCol = colLetter(IDX_TYPE + 1);
+  const patches = toMark.map((r) => ({
+    range: `${TAB}!${typeCol}${r.rowIndex}`,
+    values: [["Transfer"]],
+  }));
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId,
+    requestBody: { valueInputOption: "RAW", data: patches },
+  });
+  return { pairs: toMark.length / 2, patched: toMark.length };
+}
+
+module.exports = {
+  upsertTransactions,
+  readVendorMap,
+  markTransfers,
+  findTransferPairs,
+  HEADERS,
+  TAB,
+};

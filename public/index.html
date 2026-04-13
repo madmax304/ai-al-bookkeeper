@@ -70,6 +70,7 @@
             <div class="institution">${label} — ${info.institution}</div>
             <div class="details">${(info.accounts || []).map(a => `${a.name} (…${a.mask || ""})`).join(", ")}</div>
           </div>
+          <button style="flex:0 0 auto; width:auto; padding:8px 14px; font-size:13px;" onclick="relink('${label}')">Re-link</button>
         </div>
       `).join("");
     }
@@ -105,6 +106,25 @@
         },
       });
       handler.open();
+    }
+
+    async function relink(label) {
+      status.style.display = "none";
+      try {
+        const res = await fetch("/api/relink", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ label }),
+        });
+        const { link_token, error } = await res.json();
+        if (error) throw new Error(JSON.stringify(error));
+        sessionStorage.setItem("plaid_link_token", link_token);
+        sessionStorage.setItem("plaid_label", label);
+        openLink({ token: link_token, label });
+      } catch (err) {
+        status.className = "status error";
+        status.textContent = `Re-link error: ${err.message}`;
+      }
     }
 
     async function connect(label) {
