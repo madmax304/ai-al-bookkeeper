@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node src/server.js",
     "sync": "node src/sync.js",
-    "link": "node src/server.js"
+    "link": "node src/server.js",
+    "setup": "node src/setup.js",
+    "test": "node --test tests/"
   },
   "dependencies": {
     "dotenv": "^16.4.0",

@@ -242,4 +242,30 @@ async function upsertTransactions(spreadsheetId, added, removed = []) {
   };
 }
 
-module.exports = { upsertTransactions, HEADERS, TAB };
+/**
+ * Read the Vendor Map tab (two columns: substring, category) into a plain
+ * object. Returns null if the tab doesn't exist or is empty — callers should
+ * fall back to local defaults.
+ */
+async function readVendorMap(spreadsheetId) {
+  const sheets = getClient();
+  try {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: "Vendor Map!A2:B",
+    });
+    const rows = res.data.values || [];
+    if (rows.length === 0) return null;
+    const map = {};
+    for (const [vendor, category] of rows) {
+      if (vendor && category) map[vendor.toUpperCase()] = category;
+    }
+    return Object.keys(map).length > 0 ? map : null;
+  } catch (err) {
+    // Tab missing is fine; fall back to defaults silently
+    if (err.response?.status === 400 || err.code === 400) return null;
+    throw err;
+  }
+}
+
+module.exports = { upsertTransactions, readVendorMap, HEADERS, TAB };

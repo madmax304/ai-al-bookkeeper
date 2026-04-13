@@ -10,8 +10,8 @@
  */
 const { plaidClient } = require("./plaid-client");
 const tokenStore = require("./token-store");
-const { categorizeAll } = require("./categorizer");
-const { upsertTransactions } = require("./sheets");
+const { categorizeAll, DEFAULT_VENDORS } = require("./categorizer");
+const { upsertTransactions, readVendorMap } = require("./sheets");
 require("dotenv").config({ path: require("path").join(__dirname, "..", ".env.local") });
 
 async function syncAccount(label, accountData) {
@@ -87,13 +87,21 @@ async function syncAll(targetLabel) {
     }
   }
 
-  const combined = categorizeAll([...allAdded, ...allModified]);
-
   const spreadsheetId = process.env.NATAL_SHEET_ID;
   if (!spreadsheetId) {
     console.error("\nNATAL_SHEET_ID not set in .env.local — skipping sheet write.");
     return { added: allAdded, modified: allModified, removed: allRemoved };
   }
+
+  const sheetVendorMap = await readVendorMap(spreadsheetId);
+  const vendorMap = sheetVendorMap
+    ? { ...DEFAULT_VENDORS, ...sheetVendorMap }
+    : DEFAULT_VENDORS;
+  if (sheetVendorMap) {
+    console.log(`  Vendor map: ${Object.keys(sheetVendorMap).length} entries from sheet`);
+  }
+
+  const combined = categorizeAll([...allAdded, ...allModified], vendorMap);
 
   await upsertTransactions(spreadsheetId, combined, allRemoved);
 
